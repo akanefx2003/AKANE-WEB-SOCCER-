@@ -1,13 +1,16 @@
 'use strict';
 
 // Source de données : API publique d'ESPN (sans clé). Elle n'est pas documentée officiellement :
-// si elle change un jour, ce fichier est le seul à adapter. Les adresses se règlent par variables
-// d'environnement (utile pour les tests).
+// si elle change un jour, ce fichier est le seul à adapter.
+const { cached, mapLimit } = require('./cache');
+
 const SITE = process.env.ESPN_SITE || 'https://site.api.espn.com/apis/site/v2/sports/soccer';
 const V2 = process.env.ESPN_V2 || 'https://site.api.espn.com/apis/v2/sports/soccer';
 const UA = 'Mozilla/5.0 (compatible; CoupDEnvoi/1.0)';
 
 const DAY = 24 * 3600 * 1000;
+const PAST_DAYS = 4;
+const FUTURE_DAYS = 7;
 
 async function getJSON(url, ms = 8000) {
   const ctrl = new AbortController();
@@ -54,12 +57,44 @@ function normalizeEvent(e) {
   };
 }
 
-// Matchs des 10 derniers jours et des 14 prochains jours.
+// ESPN refuse les plages de dates pour le foot (erreur 400) : on demande un seul jour à la fois.
+// Chaque jour a son propre cache : long pour les jours passés, court pour aujourd'hui.
+function fetchDay(id, day, kind) {
+  return cached('d:' + id + ':' + day, async () => {
+    const data = await getJSON(SITE + '/' + id + '/scoreboard?dates=' + day);
+    const matches = (data.events || []).map(normalizeEvent).filter(Boolean);
+    let ttl = kind === 'past' ? 3 * 3600 * 1000 : 15 * 60 * 1000;
+    if (kind === 'today') ttl = matches.some((m) => m.state === 'in') ? 30 * 1000 : 5 * 60 * 1000;
+    return { value: matches, ttl };
+  });
+}
+
+// Matchs des 4 derniers jours et des 7 prochains jours.
 async function fetchMatches(id) {
   const now = Date.now();
-  const url = SITE + '/' + id + '/scoreboard?limit=300&dates=' + ymd(now - 10 * DAY) + '-' + ymd(now + 14 * DAY);
-  const data = await getJSON(url);
-  const matches = (data.events || []).map(normalizeEvent).filter(Boolean);
+  // Si le jour d'aujourd'hui échoue (mauvais identifiant), on s'arrête tout de suite.
+  const todayList = await fetchDay(id, ymd(now), 'today');
+
+  const offsets = [];
+  for (let i = -PAST_DAYS; i <= FUTURE_DAYS; i++) if (i !== 0) offsets.push(i);
+  const lists = await mapLimit(offsets, 4, async (i) => {
+    try {
+      return await fetchDay(id, ymd(now + i * DAY), i < 0 ? 'past' : 'future');
+    } catch (err) {
+      return [];
+    }
+  });
+
+  const seen = new Set();
+  const matches = [];
+  [todayList].concat(lists).forEach((list) => {
+    list.forEach((m) => {
+      if (!seen.has(m.id)) {
+        seen.add(m.id);
+        matches.push(m);
+      }
+    });
+  });
   matches.sort((a, b) => new Date(a.date) - new Date(b.date));
   const live = matches.some((m) => m.state === 'in');
   return { value: { matches }, ttl: live ? 30 * 1000 : 5 * 60 * 1000 };
